@@ -21,6 +21,7 @@ module System.OSX.FSEvents
   ) where
 
 import Control.Concurrent
+import Control.Concurrent.Chan
 import Control.Concurrent.MVar
 import Control.Exception (bracket)
 import Control.Monad
@@ -110,7 +111,7 @@ eventStreamCreate :: [FilePath]      -- ^ The paths to watch
                   -> Double          -- ^ Latency
                   -> Bool            -- ^ Process event immediately if no other events received for at least latency
                   -> Bool            -- ^ Ignore events caused by current process
-                  -> Bool            -- ^ Get file-level notifications instead of directory level 
+                  -> Bool            -- ^ Get file-level notifications instead of directory level
                   -> (Event -> IO a) -- ^ The action to run when an event has taken place
                   -> IO EventStream  -- ^ The event stream, use this to destroy the stream
 eventStreamCreate ps latency nodefer noself filelevel a = withCStrings ps $ \pp n ->
@@ -124,6 +125,34 @@ eventStreamCreate ps latency nodefer noself filelevel a = withCStrings ps $ \pp 
     destroyed <- newMVar False
     forkIO $ consumeMsgs h a
     return $ EventStream pw destroyed
+        where
+          flags = condFlag createFlagNoDefer nodefer .|.
+                  condFlag createFlagIgnoreSelf noself .|.
+                  condFlag createFlagFileEvents filelevel
+
+-- | Create an FSEvents watch for a list of paths and publish events to a Chan.
+-- Events will be written to the returned Chan until the 'EventStream'
+-- destroyed again.
+-- Note: it's relatively expensive to create a watch, since each watch
+-- uses an operating system thread for its event loop.
+eventStreamPublish :: [FilePath]                    -- ^ The paths to watch
+                   -> Double                        -- ^ Latency
+                   -> Bool                          -- ^ Process event immediately if no other events received for at least latency
+                   -> Bool                          -- ^ Ignore events caused by current process
+                   -> Bool                          -- ^ Get file-level notifications instead of directory level
+                   -> IO (EventStream, Chan Event)  -- ^ The event stream and dispatch channel
+eventStreamPublish ps latency nodefer noself filelevel = withCStrings ps $ \pp n ->
+  alloca $ \pfd -> do
+  alloca $ \ppw -> do
+    when (latency < 0) $ ioError (userError "latency must be nonnegative")
+    r <- c_createWatch pp (fromIntegral n) flags 0 (realToFrac latency) pfd ppw
+    when (r /= 0) $ ioError (userError "could not create file system event stream")
+    h <- fdToHandle . Fd =<< peek pfd
+    pw <- peek ppw
+    destroyed <- newMVar False
+    chan <- newChan :: Chan Event
+    forkIO $ dispatchMsgs h chan
+    return $ (EventStream pw destroyed, chan)
         where
           flags = condFlag createFlagNoDefer nodefer .|.
                   condFlag createFlagIgnoreSelf noself .|.
@@ -161,13 +190,36 @@ consumeMsgs h a = readEvents
             let header = runGet readHeader b
             case header of
               Left _ -> stop
-              Right (eventId, flags, pathLen) -> do 
+              Right (eventId, flags, pathLen) -> do
                 bp <- B.hGet h (fromIntegral pathLen)
                 if B.length bp /= fromIntegral pathLen
                   then stop
                   else do
                     let p = TE.decodeUtf8With TE.lenientDecode bp
                     a $ Event (T.unpack p) eventId flags
+                    readEvents
+
+      stop = hClose h >> return ()
+      readHeader = liftM3 (,,) getWord64host getWord64host getWord64host
+
+dispatchMsgs :: Handle -> Chan Event -> IO ()
+dispatchMsgs h c = readEvents
+    where
+      readEvents = do
+        b <- B.hGet h 24
+        if B.length b < 24
+          then stop
+          else do
+            let header = runGet readHeader b
+            case header of
+              Left _ -> stop
+              Right (eventId, flags, pathLen) -> do
+                bp <- B.hGet h (fromIntegral pathLen)
+                if B.length bp /= fromIntegral pathLen
+                  then stop
+                  else do
+                    let p = TE.decodeUtf8With TE.lenientDecode bp
+                    writeChan $ Event (T.unpack p) eventId flags $ c
                     readEvents
 
       stop = hClose h >> return ()
